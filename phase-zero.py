@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Notes:
-─────────────────────────────────────────
 1. Flow matching policy (Section V-A, Eq. 4)
    The policy generates actions via a learned velocity field f_θ, trained with the
    CFM.
@@ -493,7 +492,7 @@ def main():
     p.add_argument("--env", type=str, default="cube-single-play-singletask-v0")
     p.add_argument("--seed", type=int, default=0)
 
-    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gamma", type=float, default=1.0) # "(we do not use a discount factor, though one could easily be added)" - pg. 3 - works fine with 0.99 btw.
 
     p.add_argument("--num_bins", type=int, default=201)
     p.add_argument("--vmin", type=float, default=None)
