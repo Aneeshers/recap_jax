@@ -193,6 +193,39 @@ def compute_rtg(rewards: np.ndarray, dones: np.ndarray, gamma: float) -> np.ndar
     return rtg
 
 
+def compute_lambda_returns(
+    obs: np.ndarray,
+    rewards: np.ndarray,
+    dones: np.ndarray,
+    value_net,
+    value_params,
+    bin_centers: np.ndarray,
+    gamma: float,
+    lam: float,
+    batch_size: int = 16384,
+) -> np.ndarray:
+    """Compute TD(λ) returns via the backward-view recursion:
+
+      G_t^λ = r_t + γ[(1−λ)V(s_{t+1}) + λG_{t+1}^λ]   if not done[t]
+      G_t^λ = r_t                                          if done[t]
+
+    Episode boundaries are respected: no bootstrapping through a terminal.
+    """
+    V = batched_value_expectation(value_net, value_params, obs, bin_centers, batch_size)
+    N = len(rewards)
+    G = np.zeros(N, dtype=np.float32)
+    running_G = 0.0
+    for t in reversed(range(N)):
+        if dones[t]:
+            G[t] = rewards[t]
+            running_G = rewards[t]
+        else:
+            next_v = float(V[t + 1]) if t + 1 < N else 0.0
+            G[t] = rewards[t] + gamma * ((1.0 - lam) * next_v + lam * running_G)
+            running_G = G[t]
+    return G
+
+
 def make_bins(rtg, num_bins, vmin, vmax):
     if vmin is None:
         vmin = float(np.percentile(rtg, 1.0))
@@ -239,57 +272,94 @@ def rank_correlation(x: np.ndarray, y: np.ndarray) -> float:
 
 # Training Steps (return grad_norm for logging)
 
-def make_value_train_step(value_net: ValueNet):
-    """Value step that also returns gradient norm."""
-    def step(state, obs_b, bin_b):
-        def loss_fn(params):
-            logits = value_net.apply({"params": params}, obs_b)
-            return optax.softmax_cross_entropy_with_integer_labels(logits, bin_b).mean()
-            # don't do integer bins
-        loss, grads = jax.value_and_grad(loss_fn)(state.params)
-        grad_norm = optax.global_norm(grads)
-        state = state.apply_gradients(grads=grads)
-        return state, loss, grad_norm
+def make_value_scan(value_net):
+    """K gradient steps in one pmap+scan call.
 
-    return jax.jit(step)
+    Signature: scan_fn(state, obs_chunks, bins_chunks)
+      obs_chunks:  [n_dev, K, batch, obs_dim]  — sharded along axis 0
+      bins_chunks: [n_dev, K, batch]
+    Returns: (state, last_loss[n_dev], last_grad_norm[n_dev])
+    """
+    @partial(jax.pmap, axis_name="devices")
+    def scan_fn(state, obs_chunks, bins_chunks):
+
+        def body(carry, batch):
+            state = carry
+            obs_b, bins_b = batch
+
+            def loss_fn(params):
+                logits = value_net.apply({"params": params}, obs_b)
+                return optax.softmax_cross_entropy_with_integer_labels(logits, bins_b).mean()
+
+            loss, grads = jax.value_and_grad(loss_fn)(state.params)
+            grads = jax.lax.pmean(grads, axis_name="devices")
+            loss  = jax.lax.pmean(loss,  axis_name="devices")
+            grad_norm = optax.global_norm(grads)
+            state = state.apply_gradients(grads=grads)
+            return state, (loss, grad_norm)
+
+        state, (losses, grad_norms) = jax.lax.scan(
+            body, state, (obs_chunks, bins_chunks)
+        )
+        return state, losses[-1], grad_norms[-1]
+
+    return scan_fn
 
 
-def make_flow_actor_train_step(flow_actor, action_low, action_high, cond_dropout_rate=0.3):
-    """Flow actor step that also returns gradient norm."""
-    low = jnp.asarray(action_low, dtype=jnp.float32)
-    high = jnp.asarray(action_high, dtype=jnp.float32)
+def make_actor_scan(flow_actor, action_low, action_high, cond_dropout_rate=0.3):
+    """K gradient steps in one pmap+scan call.
+
+    Signature: scan_fn(state, obs_chunks, acts_chunks, cond_chunks, rng)
+      obs_chunks:  [n_dev, K, batch, obs_dim]  — sharded
+      acts_chunks: [n_dev, K, batch, act_dim]  — sharded
+      cond_chunks: [n_dev, K, batch]            — sharded
+      rng:         [n_dev, 2]                   — per-device PRNGKey, sharded
+    Returns: (state, rng[n_dev,2], last_loss[n_dev], last_grad_norm[n_dev])
+    """
+    low   = jnp.asarray(action_low,  dtype=jnp.float32)
+    high  = jnp.asarray(action_high, dtype=jnp.float32)
     scale = (high - low) / 2.0
-    bias = (high + low) / 2.0
+    shift = (high + low) / 2.0
 
-    def normalize_actions(a):
-        return (a - bias) / (scale + 1e-8)
+    @partial(jax.pmap, axis_name="devices")
+    def scan_fn(state, obs_chunks, acts_chunks, cond_chunks, rng):
 
-    def step(state, obs_b, act_b, cond_b, rng):
-        rng_eta, rng_noise, rng_dropout = jax.random.split(rng, 3)
-        B = obs_b.shape[0]
+        def body(carry, batch):
+            state, rng = carry
+            obs_b, acts_b, cond_b = batch
 
-        dropout_mask = jax.random.uniform(rng_dropout, shape=(B,)) < cond_dropout_rate
-        cond_b_dropped = jnp.where(dropout_mask, 0, cond_b)
+            rng, sub = jax.random.split(rng)
+            rng_eta, rng_noise, rng_dropout = jax.random.split(sub, 3)
+            B = obs_b.shape[0]
 
-        a_norm = normalize_actions(act_b)
-        eta = jax.random.uniform(rng_eta, shape=(B,))
-        omega = jax.random.normal(rng_noise, shape=a_norm.shape)
-        eta_bc = eta[:, None]
-        x_t = eta_bc * a_norm + (1.0 - eta_bc) * omega
-        v_target = a_norm - omega
+            dropout_mask = jax.random.uniform(rng_dropout, (B,)) < cond_dropout_rate
+            cond_b_dropped = jnp.where(dropout_mask, 0, cond_b)
 
-        def loss_fn(params):
-            v_pred = flow_actor.apply(
-                {"params": params}, obs_b, cond_b_dropped, x_t, eta
-            )
-            return jnp.mean(jnp.sum((v_pred - v_target) ** 2, axis=-1))
+            a_norm = (acts_b - shift) / (scale + 1e-8)
+            eta    = jax.random.uniform(rng_eta,   (B,))
+            omega  = jax.random.normal(rng_noise,  a_norm.shape)
+            x_t    = eta[:, None] * a_norm + (1.0 - eta[:, None]) * omega
+            v_target = a_norm - omega
 
-        loss, grads = jax.value_and_grad(loss_fn)(state.params)
-        grad_norm = optax.global_norm(grads)
-        state = state.apply_gradients(grads=grads)
-        return state, loss, grad_norm
+            def loss_fn(params):
+                v_pred = flow_actor.apply(
+                    {"params": params}, obs_b, cond_b_dropped, x_t, eta
+                )
+                return jnp.mean(jnp.sum((v_pred - v_target) ** 2, axis=-1))
 
-    return jax.jit(step)
+            loss, grads = jax.value_and_grad(loss_fn)(state.params)
+            grads = jax.lax.pmean(grads, axis_name="devices")
+            loss  = jax.lax.pmean(loss,  axis_name="devices")
+            grad_norm = optax.global_norm(grads)
+            state = state.apply_gradients(grads=grads)
+            return (state, rng), (loss, grad_norm)
+
+        (state, rng), (losses, grad_norms) = jax.lax.scan(
+            body, (state, rng), (obs_chunks, acts_chunks, cond_chunks)
+        )
+        return state, rng, losses[-1], grad_norms[-1]
+
+    return scan_fn
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -533,13 +603,22 @@ def main():
     p.add_argument("--diag_batch", type=int, default=2048,
                    help="Batch size for diagnostic forward passes")
 
+    p.add_argument("--use_lambda_returns", action="store_true", default=False,
+                   help="Use iterated TD(λ) targets for value training instead of plain MC returns")
+    p.add_argument("--lambda_val", type=float, default=0.95,
+                   help="λ for TD(λ) returns (only used when --use_lambda_returns)")
+    p.add_argument("--lambda_iters", type=int, default=2,
+                   help="Number of TD(λ) re-fitting iterations after initial MC training")
+
     args = p.parse_args()
 
-    run_name = args.wandb_run or f"phase0-{args.env}-s{args.seed}"
+    method_tag = "lambda" if args.use_lambda_returns else "mc"
+    run_name = args.wandb_run or f"phase0-{args.env}-s{args.seed}-{method_tag}"
     if args.no_wandb:
         wandb.init(mode="disabled")
     else:
-        wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
+        wandb.init(project=args.wandb_project, name=run_name, config=vars(args),
+                   tags=[method_tag])
 
     print(f"{'='*60}")
     print(f"RECAP Phase 0: {args.env}")
@@ -644,70 +723,130 @@ def main():
                "model/actor_params": act_param_count}, step=0)
 
     # [4/7] Train Value Function
-    print(f"\n[4/7] Training value function ({args.value_steps} steps)...")
+    total_iters = (1 + args.lambda_iters) if args.use_lambda_returns else 1
+    method_desc = (f"MC→λ ({args.lambda_iters} refit iters, λ={args.lambda_val})"
+                   if args.use_lambda_returns else "MC only")
+    print(f"\n[4/7] Training value function ({method_desc}, {args.value_steps} steps/iter)...")
+
+    n_dev = jax.local_device_count()
+    _get_params = lambda state: jax.tree_util.tree_map(lambda x: x[0], state.params)
+    print(f"  Devices: {n_dev}")
 
     value_state = TrainState.create(
         apply_fn=value_net.apply,
         params=value_params,
         tx=optax.adam(args.value_lr),
     )
-    value_step = make_value_train_step(value_net)
+    value_state = jax.device_put_replicated(value_state, jax.local_devices())
+    value_scan = make_value_scan(value_net)
     value_diag = make_value_diagnostics(
         value_net, jnp.asarray(bin_centers, dtype=jnp.float32)
     )
 
-    @jax.jit
-    def sample_train_batch(rng_key):
-        # Sample from train indices only
-        raw_idx = jax.random.randint(rng_key, (args.batch,), 0, n_train)
-        return train_idx_j[raw_idx]
+    assert args.value_steps % args.log_interval == 0, (
+        f"value_steps ({args.value_steps}) must be divisible by log_interval ({args.log_interval})"
+    )
+    n_value_chunks = args.value_steps // args.log_interval
+    K = args.log_interval  # steps per scan chunk
+
+    # Start with MC bins; updated each λ iteration
+    current_bins_j = bins_j          # full-dataset bin targets (int32)
+    current_bins_val_j = bins_val_j  # validation subset bin targets (int32)
 
     rng = jax.random.PRNGKey(args.seed + 123)
-    t0 = time.time()
 
-    for t in range(args.value_steps):
-        rng, sub = jax.random.split(rng)
-        idx = sample_train_batch(sub)
-        value_state, loss, grad_norm = value_step(value_state, obs_j[idx], bins_j[idx])
+    for iter_idx in range(total_iters):
+        iter_label = "MC" if iter_idx == 0 else f"λ-iter{iter_idx}"
+        print(f"  [iter {iter_idx+1}/{total_iters}] {iter_label}")
+        step_offset = iter_idx * args.value_steps
+        iter_idx_j  = jnp.int32(iter_idx)
+        t0 = time.time()
+        last_loss = last_grad_norm = 0.0
 
-        if (t + 1) % args.log_interval == 0:
-            wandb.log({
-                "value/train_loss": float(loss),
-                "value/grad_norm": float(grad_norm),
-                "value/step": t + 1,
-            }, step=t + 1)
-
-        if (t + 1) % args.diag_interval == 0:
-            val_loss, v_pred_j, mae, mean_bias, entropy = value_diag(
-                value_state.params, obs_val_j, bins_val_j, rtg_val_j
+        for chunk in range(n_value_chunks):
+            rng, sub = jax.random.split(rng)
+            # Sample K*n_dev*batch indices from train set, reshape to [n_dev, K, batch, ...]
+            raw_idx   = jax.random.randint(sub, (K * n_dev * args.batch,), 0, n_train)
+            all_idx   = train_idx_j[raw_idx]
+            obs_chunks  = obs_j[all_idx].reshape(K, n_dev, args.batch, obs_dim).transpose(1, 0, 2, 3)
+            bins_chunks = current_bins_j[all_idx].reshape(K, n_dev, args.batch).transpose(1, 0, 2)
+            # K gradient steps
+            value_state, last_loss_d, last_grad_norm_d = value_scan(
+                value_state, obs_chunks, bins_chunks
             )
-            v_pred_np = np.array(v_pred_j, dtype=np.float32)
-            rho = rank_correlation(v_pred_np, rtg_val_np)
+            last_loss      = float(last_loss_d[0])
+            last_grad_norm = float(last_grad_norm_d[0])
 
-            elapsed = time.time() - t0
-            sps = (t + 1) / elapsed
+            global_step = step_offset + (chunk + 1) * K
 
             wandb.log({
-                "value/val_loss": float(val_loss),
-                "value/val_mae": float(mae),
-                "value/val_rank_corr": rho,
-                "value/val_mean_bias": float(mean_bias),
-                "value/val_entropy": float(entropy),
-                "value/step": t + 1,
-                "perf/value_sps": sps,
-            }, step=t + 1)
+                "value/train_loss": last_loss,
+                "value/grad_norm":  last_grad_norm,
+                "value/iter":       iter_idx,
+                "value/step":       global_step,
+            }, step=global_step)
 
-            print(f"  step {t+1:>6d}/{args.value_steps}  "
-                  f"train_loss={float(loss):.4f}  "
-                  f"val_mae={float(mae):.3f}  "
-                  f"rank_ρ={rho:.3f}  "
-                  f"bias={float(mean_bias):.3f}  "
-                  f"entropy={float(entropy):.2f}  "
-                  f"[{sps:.0f} sps]")
+            if global_step % args.diag_interval == 0:
+                val_loss, v_pred_j, mae, mean_bias, entropy = value_diag(
+                    _get_params(value_state), obs_val_j, current_bins_val_j, rtg_val_j
+                )
+                v_pred_np = np.array(v_pred_j, dtype=np.float32)
+                rho = rank_correlation(v_pred_np, rtg_val_np)
+
+                elapsed = time.time() - t0
+                sps = (chunk + 1) * K / elapsed
+
+                wandb.log({
+                    "value/val_loss":      float(val_loss),
+                    "value/val_mae":       float(mae),
+                    "value/val_rank_corr": rho,
+                    "value/val_mean_bias": float(mean_bias),
+                    "value/val_entropy":   float(entropy),
+                    "value/step":          global_step,
+                    "value/iter":          iter_idx,
+                    "perf/value_sps":      sps,
+                }, step=global_step)
+
+                print(f"    step {global_step:>8d}/{total_iters * args.value_steps}  "
+                      f"train_loss={last_loss:.4f}  "
+                      f"val_mae={float(mae):.3f}  "
+                      f"rank_ρ={rho:.3f}  "
+                      f"bias={float(mean_bias):.3f}  "
+                      f"entropy={float(entropy):.2f}  "
+                      f"[{sps:.0f} sps]")
+
+        # After each non-final iteration, compute λ-returns and update targets
+        if args.use_lambda_returns and iter_idx < total_iters - 1:
+            print(f"  Computing λ-returns (λ={args.lambda_val}) for next iteration...")
+            lambda_rtg = compute_lambda_returns(
+                obs, rews, dones,
+                value_net, _get_params(value_state),
+                bin_centers, args.gamma, args.lambda_val,
+            )
+            lambda_bins = discretize_to_bins(lambda_rtg, vmin, vmax, args.num_bins)
+            current_bins_j     = jnp.asarray(lambda_bins,          dtype=jnp.int32)
+            current_bins_val_j = jnp.asarray(lambda_bins[val_idx], dtype=jnp.int32)
+            wandb.log({
+                "value/lambda_rtg_mean": float(lambda_rtg.mean()),
+                "value/lambda_rtg_std":  float(lambda_rtg.std()),
+                "value/iter": iter_idx,
+            }, step=step_offset + args.value_steps)
+
+    # Log final value diagnostics to summary for direct cross-run comparison
+    final_val_loss, final_v_pred_j, final_mae, final_mean_bias, final_entropy = value_diag(
+        _get_params(value_state), obs_val_j, bins_val_j, rtg_val_j
+    )
+    final_v_pred_np = np.array(final_v_pred_j, dtype=np.float32)
+    final_rho = rank_correlation(final_v_pred_np, rtg_val_np)
+    wandb.run.summary["final/value_val_loss"]      = float(final_val_loss)
+    wandb.run.summary["final/value_val_mae"]       = float(final_mae)
+    wandb.run.summary["final/value_val_rank_corr"] = final_rho
+    wandb.run.summary["final/value_val_mean_bias"] = float(final_mean_bias)
+    wandb.run.summary["final/value_val_entropy"]   = float(final_entropy)
 
     # [5/7] Compute Advantages
     print("\n[5/7] Computing advantages...")
-    v_pred = batched_value_expectation(value_net, value_state.params, obs, bin_centers)
+    v_pred = batched_value_expectation(value_net, _get_params(value_state), obs, bin_centers)
     adv = rtg - v_pred # RTG is an unbiased estimate of Q.
 
     epsilon = float(np.quantile(adv, 1.0 - args.pos_frac))
@@ -745,7 +884,8 @@ def main():
         params=actor_params,
         tx=optax.adam(args.actor_lr),
     )
-    actor_step = make_flow_actor_train_step(
+    actor_state = jax.device_put_replicated(actor_state, jax.local_devices())
+    actor_scan = make_actor_scan(
         flow_actor, action_low=low, action_high=high,
         cond_dropout_rate=args.cond_dropout_rate,
     )
@@ -760,59 +900,73 @@ def main():
     diag_rng_fixed = jax.random.PRNGKey(args.seed + 5555)
     n_diag = min(args.diag_batch, n_val)
     diag_idx = val_idx[:n_diag]
-    diag_obs_j = jnp.asarray(obs[diag_idx], dtype=jnp.float32)
-    diag_acts_j = jnp.asarray(acts[diag_idx], dtype=jnp.float32)
-    diag_cond_j = jnp.asarray(cond_id[diag_idx], dtype=jnp.int32)
+    diag_obs_j  = jnp.asarray(obs[diag_idx],        dtype=jnp.float32)
+    diag_acts_j = jnp.asarray(acts[diag_idx],       dtype=jnp.float32)
+    diag_cond_j = jnp.asarray(cond_id[diag_idx],    dtype=jnp.int32)
 
-    @jax.jit
-    def sample_full_batch(rng_key):
-        return jax.random.randint(rng_key, (args.batch,), 0, n_data)
+    assert args.actor_steps % args.log_interval == 0, (
+        f"actor_steps ({args.actor_steps}) must be divisible by log_interval ({args.log_interval})"
+    )
+    n_actor_chunks = args.actor_steps // args.log_interval
 
-    # Use a separate step counter for actor (offset from value steps)
-    actor_step_offset = args.value_steps + 2
+    # Step counter offset — continues from where value training ended
+    actor_step_offset = total_iters * args.value_steps + 2
+
+    # Per-device RNG for actor noise/dropout — carried across chunks
+    rng, rng_actor = jax.random.split(rng)
+    per_dev_rng = jax.random.split(rng_actor, n_dev)  # [n_dev, 2]
+
     t0 = time.time()
+    last_loss = last_grad_norm = 0.0
 
-    for t in range(args.actor_steps):
-        rng, sub_batch, sub_flow = jax.random.split(rng, 3)
-        idx = sample_full_batch(sub_batch)
-        actor_state, loss, grad_norm = actor_step(
-            actor_state, obs_j[idx], acts_j[idx], cond_j[idx], sub_flow
+    for chunk in range(n_actor_chunks):
+        rng, sub_batch = jax.random.split(rng)
+        # Sample K*n_dev*batch indices from full dataset
+        raw_idx     = jax.random.randint(sub_batch, (K * n_dev * args.batch,), 0, n_data)
+        obs_chunks  = obs_j[raw_idx].reshape(K, n_dev, args.batch, obs_dim).transpose(1, 0, 2, 3)
+        acts_chunks = acts_j[raw_idx].reshape(K, n_dev, args.batch, act_dim).transpose(1, 0, 2, 3)
+        cond_chunks = cond_j[raw_idx].reshape(K, n_dev, args.batch).transpose(1, 0, 2)
+        # K gradient steps
+        actor_state, per_dev_rng, last_loss_d, last_grad_norm_d = actor_scan(
+            actor_state, obs_chunks, acts_chunks, cond_chunks, per_dev_rng
         )
-        global_step = actor_step_offset + t + 1
+        last_loss      = float(last_loss_d[0])
+        last_grad_norm = float(last_grad_norm_d[0])
 
-        # ── Light logging ──
-        if (t + 1) % args.log_interval == 0:
-            wandb.log({
-                "actor/train_loss": float(loss),
-                "actor/grad_norm": float(grad_norm),
-                "actor/step": t + 1,
-            }, step=global_step)
+        global_step = actor_step_offset + (chunk + 1) * K
+        actor_local_step = (chunk + 1) * K  # step within actor training phase
+
+        wandb.log({
+            "actor/train_loss": last_loss,
+            "actor/grad_norm":  last_grad_norm,
+            "actor/step":       actor_local_step,
+        }, step=global_step)
 
         # ── Heavy diagnostics: conditional losses + guidance gap ──
-        if (t + 1) % args.diag_interval == 0:
+        if global_step % args.diag_interval == 0:
             (loss_pos, loss_neg, loss_uncond,
              guidance_gap, velocity_r2, v_mag) = actor_diag(
-                actor_state.params,
+                _get_params(actor_state),
                 diag_obs_j, diag_acts_j, diag_cond_j,
                 diag_rng_fixed,  # same random draw every time
             )
 
             elapsed = time.time() - t0
-            sps = (t + 1) / elapsed
+            sps = (chunk + 1) * K / elapsed
 
             wandb.log({
-                "actor/loss_pos": float(loss_pos),
-                "actor/loss_neg": float(loss_neg),
-                "actor/loss_uncond": float(loss_uncond),
+                "actor/loss_pos":     float(loss_pos),
+                "actor/loss_neg":     float(loss_neg),
+                "actor/loss_uncond":  float(loss_uncond),
                 "actor/guidance_gap": float(guidance_gap),
-                "actor/velocity_r2": float(velocity_r2),
-                "actor/v_magnitude": float(v_mag),
-                "actor/step": t + 1,
-                "perf/actor_sps": sps,
+                "actor/velocity_r2":  float(velocity_r2),
+                "actor/v_magnitude":  float(v_mag),
+                "actor/step":         actor_local_step,
+                "perf/actor_sps":     sps,
             }, step=global_step)
 
-            print(f"  step {t+1:>6d}/{args.actor_steps}  "
-                  f"loss={float(loss):.4f}  "
+            print(f"  step {actor_local_step:>6d}/{args.actor_steps}  "
+                  f"loss={last_loss:.4f}  "
                   f"gap={float(guidance_gap):.4f}  "
                   f"R²={float(velocity_r2):.3f}  "
                   f"L_pos={float(loss_pos):.3f}  "
@@ -821,28 +975,28 @@ def main():
                   f"[{sps:.0f} sps]")
 
         # ── Periodic evaluation rollouts ──
-        if (t + 1) % args.eval_interval == 0 and (t + 1) < args.actor_steps:
-            print(f"  [eval @ step {t+1}]")
+        if global_step % args.eval_interval == 0 and actor_local_step < args.actor_steps:
+            print(f"  [eval @ step {actor_local_step}]")
             ret0, succ0 = evaluate(
-                env, flow_actor, actor_state.params,
+                env, flow_actor, _get_params(actor_state),
                 args.eval_episodes, args.seed + 999,
                 beta=0.0, action_low=low, action_high=high,
                 num_steps=args.num_euler_steps,
             )
             ret1, succ1 = evaluate(
-                env, flow_actor, actor_state.params,
+                env, flow_actor, _get_params(actor_state),
                 args.eval_episodes, args.seed + 999,
                 beta=1.0, action_low=low, action_high=high,
                 num_steps=args.num_euler_steps,
             )
             guidance_lift = ret1 - ret0
             wandb.log({
-                "eval/return_beta0": ret0,
+                "eval/return_beta0":  ret0,
                 "eval/success_beta0": succ0,
-                "eval/return_beta1": ret1,
+                "eval/return_beta1":  ret1,
                 "eval/success_beta1": succ1,
                 "eval/guidance_lift": guidance_lift,
-                "actor/step": t + 1,
+                "actor/step":         actor_local_step,
             }, step=global_step)
             print(f"    Beta=0: ret={ret0:.2f} succ={succ0:.2%}  "
                   f"Beta=1: ret={ret1:.2f} succ={succ1:.2%}  "
@@ -862,7 +1016,7 @@ def main():
     for beta in betas_to_test:
         label = {0.0: "uncond", 1.0: "pos"}.get(beta, f"cfg={beta:g}")
         avg_ret, avg_succ = evaluate(
-            env, flow_actor, actor_state.params,
+            env, flow_actor, _get_params(actor_state),
             args.eval_episodes, args.seed + 999,
             beta=beta, action_low=low, action_high=high,
             num_steps=args.num_euler_steps,
@@ -912,8 +1066,8 @@ def main():
         cond_dropout_rate=args.cond_dropout_rate,
         value_hidden=value_hidden,
         actor_hidden=actor_hidden,
-        actor_params=actor_state.params,
-        value_params=value_state.params,
+        actor_params=_get_params(actor_state),
+        value_params=_get_params(value_state),
         action_low=low,
         action_high=high,
         act_dim=act_dim,
