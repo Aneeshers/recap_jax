@@ -39,6 +39,30 @@ For headless servers:
 export MUJOCO_GL=egl
 ```
 
+## Docker (dev)
+
+This mirrors the `unifloral` dev container setup for reproducible GPU runs.
+
+1. Add your wandb API key:
+```bash
+echo "YOUR_WANDB_KEY" > dev/wandb_key
+```
+2. Build the image:
+```bash
+cd dev
+./build.sh
+```
+3. Launch an interactive container on GPU 0:
+```bash
+cd ..
+./launch_container.sh 0
+```
+4. Or run a single command (example: BC baseline):
+```bash
+cd ..
+./launch_run.sh 0 python BC_policy.py --env cube-single-play-singletask-v0 --steps 100000
+```
+
 ## Usage
 
 ### BC baseline (run this first)

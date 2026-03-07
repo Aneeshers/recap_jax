@@ -428,10 +428,9 @@ def save_checkpoint(path: str, ckpt: Checkpoint) -> None:
     with open(path, "wb") as f:
         pickle.dump(payload, f)
 
-def evaluate_chunked(env, actor, params, episodes, seed,
-                     chunk_size, action_low, action_high):
-
-    rng = np.random.RandomState(seed)
+def evaluate_chunked(env, flow_actor, actor_params, episodes, seed, beta,
+                     chunk_size, action_low, action_high, num_steps=20):
+    rng = jax.random.PRNGKey(seed)
     returns, successes = [], []
 
     for _ in range(episodes):
@@ -441,9 +440,10 @@ def evaluate_chunked(env, actor, params, episodes, seed,
         success = 0.0
 
         while not done:
-            obs_j = jnp.asarray(obs[None], dtype=jnp.float32)
-            action = np.array(actor.apply({"params": params}, obs_j)[0])
-            action = np.clip(action, action_low, action_high)
+            action, rng = sample_action_cfg(
+                flow_actor, actor_params, obs, beta, rng,
+                action_low, action_high, num_steps, deterministic=True,
+            )
 
             for _ in range(chunk_size):
                 if done:
@@ -455,6 +455,8 @@ def evaluate_chunked(env, actor, params, episodes, seed,
 
         returns.append(ep_ret)
         successes.append(success)
+
+    return float(np.mean(returns)), float(np.mean(successes))
 
 def main():
     p = argparse.ArgumentParser(

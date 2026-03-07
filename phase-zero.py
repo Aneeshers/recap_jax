@@ -97,8 +97,7 @@ import wandb
 import os
 os.environ["WANDB__SERVICE_WAIT"] = "300"
 
-# Data Loading (OGBench)
-
+# =====  Data Loading (OGBench) =====
 def load_ogbench_data(env_name: str):
     """Load environment and dataset from OGBench.
 
@@ -533,10 +532,13 @@ def main():
                    help="Fraction of data held out for validation diagnostics")
     p.add_argument("--diag_batch", type=int, default=2048,
                    help="Batch size for diagnostic forward passes")
+    p.add_argument("--use_lambda_returns", action="store_true",
+                   help="Tag run name as lambda vs MC returns")
 
     args = p.parse_args()
 
-    run_name = args.wandb_run or f"phase0-{args.env}-s{args.seed}"
+    method_tag = "lambda" if args.use_lambda_returns else "mc"
+    run_name = args.wandb_run or f"phase0-{args.env}-s{args.seed}-{method_tag}"
     if args.no_wandb:
         wandb.init(mode="disabled")
     else:
