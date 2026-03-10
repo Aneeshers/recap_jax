@@ -9,8 +9,9 @@ ENV CUDA_LIBRARY_PATH=/usr/local/cuda/lib64
 ENV TZ=Europe/London DEBIAN_FRONTEND=noninteractive
 
 # Install Python 3.10 and runtime deps
-RUN apt-get update
-RUN apt-get install -y software-properties-common \
+RUN apt-get update && apt-get install -y software-properties-common && \
+    apt-add-repository ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y \
     git \
     curl \
     python3.10 \
@@ -18,10 +19,8 @@ RUN apt-get install -y software-properties-common \
     python3.10-venv \
     python3-setuptools \
     python3-wheel \
-    python3.10-dev
-RUN apt-add-repository ppa:deadsnakes/ppa
-RUN apt-get clean
-RUN apt-get update
+    python3.10-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Create local user
 # https://jtreminio.com/blog/running-docker-containers-as-current-host-user/
