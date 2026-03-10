@@ -103,12 +103,12 @@ def load_ogbench_data(env_name: str):
 
     """
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name)
-    # breakpoint()
 
     obs = np.asarray(train_dataset["observations"], dtype=np.float32)
     actions = np.asarray(train_dataset["actions"], dtype=np.float32)
     terminals = np.asarray(train_dataset["terminals"], dtype=bool)
     masks = np.asarray(train_dataset["masks"], dtype=np.float32)
+    #TODO Do we really need to handle this for pure offline rl?
     if "rewards" in train_dataset:
         raw_rews = np.asarray(train_dataset["rewards"], dtype=np.float32)
     else:
