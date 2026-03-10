@@ -1,0 +1,53 @@
+program: phase-zero.py
+method: random
+parameters:
+  env:
+    values:
+      - antmaze-large-navigate
+      - antmaze-giant-navigate
+      - humanoidmaze-medium-navigate
+      - cube-single-play
+      - cube-double-play
+      - scene-play
+      - puzzle-3x3-play
+  actor_lr:
+    values:
+      - 1.0e-5
+      - 3.0e-5
+      - 1.0e-4
+      - 3.0e-4
+      - 1.0e-3
+  value_lr:
+    values:
+      - 1.0e-5
+      - 3.0e-5
+      - 1.0e-4
+      - 3.0e-4
+      - 1.0e-3
+  num_bins:
+    values:
+      - 51
+      - 101
+      - 201
+      - 401
+  seed:
+    values:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --env
+  - ${env}
+  - --actor_lr
+  - ${actor_lr}
+  - --value_lr
+  - ${value_lr}
+  - --num_bins
+  - ${num_bins}
+  - --seed
+  - ${seed}

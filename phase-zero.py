@@ -413,7 +413,12 @@ def euler_sample_cfg(flow_actor, params, obs, rng, beta: float, num_steps: int =
         v_g = v_u + beta * (v_p - v_u)
         return x + dt * v_g
 
-    return jax.lax.fori_loop(0, num_steps, body_fn, x0) #change to scan
+    def scan_fn(x, k):
+        return body_fn(k, x), None
+
+    ks = jnp.arange(num_steps)
+    x_final, _ = jax.lax.scan(scan_fn, x0, ks)
+    return x_final
 
 
 def sample_action_cfg(flow_actor, params, obs, beta, rng, action_low, action_high,
