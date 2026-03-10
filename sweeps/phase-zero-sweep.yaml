@@ -3,13 +3,13 @@ method: random
 parameters:
   env:
     values:
-      - antmaze-large-navigate
-      - antmaze-giant-navigate
-      - humanoidmaze-medium-navigate
-      - cube-single-play
-      - cube-double-play
-      - scene-play
-      - puzzle-3x3-play
+      - antmaze-large-navigate-singletask-v0
+      - antmaze-giant-navigate-singletask-v0
+      - humanoidmaze-medium-navigate-singletask-v0
+      - cube-single-play-singletask-v0
+      - cube-double-play-singletask-v0
+      - scene-play-singletask-v0
+      - puzzle-3x3-play-singletask-v0
   actor_lr:
     values:
       - 1.0e-5
@@ -38,15 +38,7 @@ parameters:
       - 3
       - 4
 command:
+  - ${env}
   - python3.10
   - ${program}
-  - --env
-  - ${env}
-  - --actor_lr
-  - ${actor_lr}
-  - --value_lr
-  - ${value_lr}
-  - --num_bins
-  - ${num_bins}
-  - --seed
-  - ${seed}
+  - ${args}

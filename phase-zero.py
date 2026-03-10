@@ -103,12 +103,22 @@ def load_ogbench_data(env_name: str):
 
     """
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name)
+    # breakpoint()
 
     obs = np.asarray(train_dataset["observations"], dtype=np.float32)
     actions = np.asarray(train_dataset["actions"], dtype=np.float32)
-    raw_rews = np.asarray(train_dataset["rewards"], dtype=np.float32)
     terminals = np.asarray(train_dataset["terminals"], dtype=bool)
     masks = np.asarray(train_dataset["masks"], dtype=np.float32)
+    if "rewards" in train_dataset:
+        raw_rews = np.asarray(train_dataset["rewards"], dtype=np.float32)
+    else:
+        raw_rews = None
+
+    # Some OGBench datasets omit rewards. Per README, masks==0 indicates success,
+    # so we can synthesize reward=1 at success, 0 otherwise.
+    if raw_rews is None or (np.all(raw_rews == 0) and (masks == 0).any()):
+        raw_rews = (masks == 0).astype(np.float32)
+        print("  rewards missing/empty -> synthesized from masks (1 at success, 0 otherwise)")
 
     print(f"  raw rewards unique: {np.unique(raw_rews)}")
     print(f"  raw rewards == 0 count: {(raw_rews == 0).sum()}")
@@ -117,7 +127,7 @@ def load_ogbench_data(env_name: str):
     print(f"  masks == 0 (task complete): {(masks == 0).sum()}")
     print(f"  rewards at terminals: {np.unique(raw_rews[terminals])}")
     print(f"  dataset keys: {list(train_dataset.keys())}")
-    rewards = np.asarray(train_dataset["rewards"], dtype=np.float32)
+    rewards = raw_rews
 
     return env, obs, actions, rewards, terminals
 
